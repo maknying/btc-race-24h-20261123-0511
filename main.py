@@ -4,7 +4,9 @@ Idea: the 1-minute cbBTC tape is mostly noise (about 8 bps/bar of jitter
 against a slow drift), so fast trend rules bleed ~26 bps per round trip in
 fees, slippage and impact and lose. This bot instead rides the drift:
 buy the whole account on the first tradable bar, then hold with a trailing
-stop 200 bps under the running peak. After a stop-out it only re-enters
+stop 200 bps under the running peak, armed only once the position is
+100 bps in profit from its entry, so an early pullback cannot whipsaw
+the bot out before the drift establishes itself. After a stop-out it only re-enters
 when the close is back above its 60-bar EMA, so it does not chase chop.
 On the published dev window that is one trade, about +$32 net, max
 drawdown about 2% — comfortably through the dev gate (net PnL > 0).
@@ -20,6 +22,7 @@ import makefun_bars
 
 MAX_SLIP_BPS = 500          # slippage cap on every order (vs latest close)
 TRAIL_BPS = 200             # trailing stop: sell when close falls this far under peak
+ARM_BPS = 100               # stop arms only after this profit from entry
 REBUY_EMA_SPAN = 60         # re-enter only when close is above this EMA
 MIN_NOTIONAL = 1_000_000    # 1 USDC in quote units
 
@@ -30,6 +33,7 @@ class TrendBot:
         self.closes = []
         self.ema = None
         self.peak = 0
+        self.entry = 0
         self.started = False
 
     def on_hello(self, state):
@@ -53,6 +57,7 @@ class TrendBot:
                 # First tradable bar: deploy the whole account.
                 if state.cash >= MIN_NOTIONAL:
                     self.started = True
+                    self.entry = close
                     self.peak = close
                     return [{"side": "buy", "symbol": sym,
                              "notional_quote_units": state.cash,
@@ -61,15 +66,19 @@ class TrendBot:
             # Re-enter only on a confirmed recovery above the slow EMA.
             if len(self.closes) > REBUY_EMA_SPAN and close > self.ema:
                 if state.cash >= MIN_NOTIONAL:
+                    self.entry = close
                     self.peak = close
                     return [{"side": "buy", "symbol": sym,
                              "notional_quote_units": state.cash,
                              "max_slippage_bps": MAX_SLIP_BPS}]
             return []
-        # Holding: trail the peak; a 200 bps pullback from it exits.
+        # Holding: trail the peak; a 200 bps pullback from it exits,
+        # but only once the stop is armed (peak 100 bps above entry), so
+        # an early pullback cannot whipsaw a fresh position out.
         if close > self.peak:
             self.peak = close
-        if (self.peak - close) * 10000 >= TRAIL_BPS * self.peak:
+        armed = (self.peak - self.entry) * 10000 >= ARM_BPS * self.entry
+        if armed and (self.peak - close) * 10000 >= TRAIL_BPS * self.peak:
             return [{"side": "sell", "symbol": sym, "qty": qty,
                      "max_slippage_bps": MAX_SLIP_BPS}]
         return []
